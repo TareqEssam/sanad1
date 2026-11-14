@@ -502,7 +502,7 @@ try { if ('BarcodeDetector' in window) barcodeDetector = new window.BarcodeDetec
 let faceDetector = null;
 try { if ('FaceDetector' in window) faceDetector = new window.FaceDetector({ fastMode: true, maxDetectedFaces: 2 }); } catch (e) {}
 
-const MAX_DIM = 1024, TEXT_MAX_DIM = 1920, TIMEOUT_MS = 45000, STEP_METERS = 0.70;
+const MAX_DIM = 1024, TEXT_MAX_DIM = 1920, TIMEOUT_MS = 25000, CLOUD_TOTAL_MS = 40000, STEP_METERS = 0.70;
 
 const LOCAL_OBJECT_MAP = Object.freeze({
   'person':        { ar: 'شخص', priority: 3, h: 1.68, w: 0.48 },
@@ -721,7 +721,7 @@ function speak(text, interrupt = true) {
     });
   } catch (e) { assistantSpeaking = false; clearSpeechWatchdog(); }
 }
-function stopSpeaking() { clearSpeechWatchdog(); if ('speechSynthesis' in window) window.speechSynthesis.cancel(); assistantSpeaking = false; }
+function stopSpeaking() { cancelCloudRequest(); clearSpeechWatchdog(); if ('speechSynthesis' in window) window.speechSynthesis.cancel(); assistantSpeaking = false; }
 
 let audioContext = null;
 function ensureAudioContext() {
@@ -1870,7 +1870,7 @@ async function captureAndAnalyze(customQuestion = null) {
         } catch (err) {
           const arch = await analyzeLocalArchitecture();
           spoken = await buildLocalSceneReport(objects, arch, await runNeuralDepthAnalysis(arch), q, modelRan, selfieCheck);
-          if (customQuestion) spoken = 'تعذر الاتصال السحابي. محلياً: ' + spoken;
+          if (cloudUserCancelled) spoken = 'ألغيت الطلب السحابي. محلياً: ' + spoken; else if (customQuestion) spoken = 'تعذر الاتصال السحابي. محلياً: ' + spoken;
         }
       } else {
         const arch = await analyzeLocalArchitecture();
@@ -1883,6 +1883,18 @@ async function captureAndAnalyze(customQuestion = null) {
   finally { isProcessing = false; }
 }
 
+// ===== التحكم في الطلبات السحابية: إلغاء من المستخدم + مهلة إجمالية =====
+let cloudInFlight = 0, cloudUserCancelled = false, cloudDeadline = 0;
+const cloudControllers = new Set();
+function cloudBegin() { if (!cloudInFlight) { cloudUserCancelled = false; cloudDeadline = Date.now() + CLOUD_TOTAL_MS; } cloudInFlight++; }
+function cloudEnd() { cloudInFlight = Math.max(0, cloudInFlight - 1); }
+function cloudController() {
+  const c = new AbortController(); cloudControllers.add(c);
+  const left = Math.max(1000, Math.min(TIMEOUT_MS, cloudDeadline - Date.now()));
+  const t = setTimeout(() => c.abort(), left);
+  return { signal: c.signal, done() { clearTimeout(t); cloudControllers.delete(c); } };
+}
+function cancelCloudRequest() { if (!cloudInFlight) return false; cloudUserCancelled = true; cloudControllers.forEach(c => c.abort()); return true; }
 function cleanText(v) { return String(v || '').replace(/[*#_`>]/g, '').replace(/\s+/g, ' ').trim(); }
 function formatCloudStructured(data, isQ) {
   if (!data || typeof data === 'string') return cleanText(data);
@@ -1898,13 +1910,13 @@ function formatCloudStructured(data, isQ) {
   return parts.filter(Boolean).join(' ');
 }
 async function callProxyWorker(imageBase64, prompt, task) {
-  const c = new AbortController(), t = setTimeout(() => c.abort(), TIMEOUT_MS);
+  cloudBegin(); const c = cloudController();
   try {
     const r = await fetch(proxyUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageBase64, prompt, task }), signal: c.signal });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || !d.ok || !d.text) throw new Error(d.error || 'Proxy error');
     return String(d.text).trim();
-  } finally { clearTimeout(t); }
+  } finally { c.done(); cloudEnd(); }
 }
 async function callCloudStructured(b64, promptText) {
   let raw = proxyUrl ? await callProxyWorker(b64, promptText, 'structured')
@@ -1930,7 +1942,7 @@ async function callSingleGeminiModel(mName, b64, promptText, structured, useThin
   if (structured) { genCfg.responseMimeType = 'application/json'; genCfg.responseJsonSchema = RESPONSE_SCHEMA; }
   const tc = useThinking ? buildGeminiThinkingConfig(mName) : null;
   if (tc) genCfg.thinkingConfig = tc;
-  const c = new AbortController(), t = setTimeout(() => c.abort(), TIMEOUT_MS);
+  const c = cloudController();
   try {
     const r = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
@@ -1943,22 +1955,27 @@ async function callSingleGeminiModel(mName, b64, promptText, structured, useThin
       const err = new Error('HTTP ' + r.status); err.status = r.status; throw err;
     }
     return (d?.candidates?.[0]?.content?.parts || []).map(p => p.text).filter(Boolean).join('').trim();
-  } finally { clearTimeout(t); }
+  } finally { c.done(); }
 }
 async function callGeminiWithFailover(b64, promptText, structured) {
   const queue = [...new Set([modelName, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.6-flash'])];
-  let lastErr;
-  for (const m of queue) {
-    try { return await callSingleGeminiModel(m, b64, promptText, structured, true); }
-    catch (e) { lastErr = e; if (![404, 429, 500, 503].includes(e.status)) throw e; }
-  }
-  throw lastErr || new Error('Gemini failed');
+  let lastErr; cloudBegin();
+  try {
+    for (const m of queue) {
+      if (cloudUserCancelled || Date.now() >= cloudDeadline) break;
+      try { return await callSingleGeminiModel(m, b64, promptText, structured, true); }
+      catch (e) { lastErr = e; if (cloudUserCancelled || ![404, 429, 500, 503].includes(e.status)) throw e; }
+    }
+    throw lastErr || new Error('Gemini failed');
+  } finally { cloudEnd(); }
 }
 async function callOpenRouterWithFailover(b64, promptText) {
   const queue = [...new Set([modelName, 'nvidia/nemotron-3.5-super-vl:free', 'openrouter/free'])];
-  let lastErr;
+  let lastErr; cloudBegin();
+  try {
   for (const m of queue) {
-    const c = new AbortController(), t = setTimeout(() => c.abort(), TIMEOUT_MS);
+    if (cloudUserCancelled || Date.now() >= cloudDeadline) break;
+    const c = cloudController();
     try {
       const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -1969,10 +1986,11 @@ async function callOpenRouterWithFailover(b64, promptText) {
       const d = await r.json().catch(() => ({}));
       if (r.ok && d?.choices?.[0]?.message?.content) return String(d.choices[0].message.content).trim();
       const err = new Error('OpenRouter ' + r.status); err.status = r.status; throw err;
-    } catch (e) { lastErr = e; if (![404, 429, 500, 502, 503].includes(e.status)) throw e; }
-    finally { clearTimeout(t); }
+    } catch (e) { lastErr = e; if (cloudUserCancelled || ![404, 429, 500, 502, 503].includes(e.status)) throw e; }
+    finally { c.done(); }
   }
   throw lastErr || new Error('OpenRouter failed');
+  } finally { cloudEnd(); }
 }
 
 function getSpeechRecognitionConstructor() { return window.SpeechRecognition || window.webkitSpeechRecognition || null; }
@@ -1982,7 +2000,7 @@ function parseVoiceCommand(raw) {
   const n = normalizeArabicCommand(raw).replace(/^(يا سند|من فضلك|لو سمحت|ممكن)\s+/, '').trim();
   if (!n) return null;
   const exact = (arr, type) => new Set(arr.map(normalizeArabicCommand)).has(n) ? { type } : null;
-  let p = exact(['اسكت', 'توقف', 'بس', 'وقف الصوت'], 'stop'); if (p) return p;
+  let p = exact(['اسكت', 'توقف', 'بس', 'وقف الصوت', 'الغاء', 'الغي', 'الغي الطلب'], 'stop'); if (p) return p;
   p = exact(['شغل الكشاف', 'افتح الكشاف', 'شغل الفلاش'], 'torchOn'); if (p) return p;
   p = exact(['اطفي الكشاف', 'اقفل الكشاف', 'اطفي الفلاش'], 'torchOff'); if (p) return p;
   p = exact(['شغل الرصد', 'تشغيل الرصد', 'شغل الملاحه'], 'navOn'); if (p) return p;
@@ -2002,6 +2020,9 @@ function parseVoiceCommand(raw) {
   p = exact(['علمني', 'علم', 'احفظ ده', 'احفظ هذا', 'علمني شيئا'], 'teach'); if (p) return p;
   p = exact(['اشيائي', 'حاجاتي', 'ايه حاجاتي'], 'listMine'); if (p) return p;
   p = exact(['ايه اللي تعرفه', 'ماذا تعرف', 'المعرفه العامه', 'حزم المعرفه', 'ايه اللي عندك'], 'listGeneral'); if (p) return p;
+  p = exact(['تراجع', 'ارجعه', 'رجعه', 'الغي الحذف', 'تراجع عن الحذف'], 'undoDel'); if (p) return p;
+  const nm = n.match(/^(?:ما اسم|ايه اسم|اسم)\s+(?:الشيء\s+|الحاجه\s+)?(رقم\s+.+)$/);
+  if (nm) return { type: 'itemNumber', target: nm[1] };
   const dl = n.match(/^(?:احذف|امسح|انسي|حذف)(?:\s+(.+))?$/);
   if (dl) {
     let tgt = (dl[1] || '').trim();
@@ -2016,7 +2037,7 @@ function parseVoiceCommand(raw) {
 }
 
 function activateVoiceCommands() {
-  if (isProcessing) return;
+  if (isProcessing && !cloudInFlight) return; // أثناء الطلب السحابي نسمع أمر الإلغاء فقط
   const R = getSpeechRecognitionConstructor();
   if (!R) { const m = 'الأوامر الصوتية غير مدعومة هنا؛ استخدم الأزرار.'; updateStatus(m); speak(m); return; }
   stopSpeaking(); stopVoiceRecognition();
@@ -2065,8 +2086,9 @@ async function findObjectLive(targetRaw) {
 
 async function handleVoiceCommand(cmd) {
   if (!cmd) return; vibrate(25);
+  if (cloudInFlight && cmd.type !== 'stop') { speak('أنتظر الرد السحابي. قل إلغاء أو اضغط إيقاف الصوت لإلغائه.'); return; }
   switch (cmd.type) {
-    case 'stop': stopSpeaking(); updateStatus('تم إيقاف الصوت.'); return;
+    case 'stop': { const had = cloudInFlight > 0; stopSpeaking(); updateStatus(had ? 'ألغيت الطلب السحابي.' : 'تم إيقاف الصوت.'); return; }
     case 'torchOn': torchManualOverride = true; await applyTorch(true, false, false); return;
     case 'torchOff': torchManualOverride = true; await applyTorch(false, false, false); return;
     case 'navOn': setNavMode(true, true); return;
@@ -2087,6 +2109,8 @@ async function handleVoiceCommand(cmd) {
     case 'listMine': await listPersonal(); return;
     case 'listGeneral': await listGeneral(); return;
     case 'delMine': await deletePersonalFlow(cmd.target); return;
+    case 'undoDel': await undoDelete(); return;
+    case 'itemNumber': await speakItemNumber(cmd.target); return;
     case 'verify': if (!(await verifyPersonal(cmd.target))) await captureAndAnalyze(cmd.question); return;
     case 'find': await findObjectLive(cmd.target); return;
     case 'question': await captureAndAnalyze(cmd.question); return;
@@ -2546,44 +2570,157 @@ async function identifyPersonal() {
   } catch (e) { speak('تعذر التعرف الآن.'); }
   finally { isProcessing = false; }
 }
+// ===== أرقام منطوقة: «100» أو «مية» أو «خمسة وعشرين» ... حتى 999. لا تخمين: أي كلمة غير مفهومة => null =====
+const SPOKEN_NUM = (() => {
+  const m = {};
+  const add = (v, ...ws) => ws.forEach(w => { m[w] = v; });
+  add(0, 'صفر');
+  add(1, 'واحد', 'واحده', 'وحده'); add(2, 'اتنين', 'اثنين', 'اثنان', 'اتنان'); add(3, 'ثلاثه', 'تلاته', 'ثلاث', 'تلات'); add(4, 'اربعه', 'اربع');
+  add(5, 'خمسه', 'خمس'); add(6, 'سته', 'ست'); add(7, 'سبعه', 'سبع'); add(8, 'ثمانيه', 'تمانيه', 'ثماني', 'تمان', 'ثمان'); add(9, 'تسعه', 'تسع');
+  add(10, 'عشره', 'عشر'); add(11, 'احدعشر', 'احداشر', 'حداشر'); add(12, 'اثنا عشر', 'اتناشر', 'اثناعشر'); add(13, 'تلتاشر', 'ثلاثهعشر', 'تلاتاشر');
+  add(14, 'اربعتاشر', 'اربعهعشر'); add(15, 'خمستاشر', 'خمسهعشر'); add(16, 'ستاشر', 'سستاشر', 'سههعشر'); add(17, 'سبعتاشر', 'سبعهعشر'); add(18, 'تمنتاشر', 'ثمانيهعشر', 'تمانتاشر'); add(19, 'تسعتاشر', 'تسعهعشر');
+  add(20, 'عشرين'); add(30, 'ثلاثين', 'تلاتين'); add(40, 'اربعين'); add(50, 'خمسين'); add(60, 'ستين'); add(70, 'سبعين'); add(80, 'ثمانين', 'تمانين'); add(90, 'تسعين');
+  add(100, 'ميه', 'مائه', 'مئه', 'ميت', 'مايه'); add(200, 'ميتين', 'مئتين', 'مائتين'); add(300, 'ثلاثمائه', 'تلتميه', 'تلاتميه', 'ثلثمائه', 'ثلاثميه', 'تلتمايه');
+  add(400, 'اربعمائه', 'ربعميه', 'اربعميه', 'اربعمايه'); add(500, 'خمسمائه', 'خمسميه', 'خمسمايه'); add(600, 'ستمائه', 'ستميه'); add(700, 'سبعمائه', 'سبعميه'); add(800, 'ثمانمائه', 'تمنميه', 'ثمانميه'); add(900, 'تسعمائه', 'تسعميه');
+  return m;
+})();
+function parseSpokenNumber(raw) {
+  let t = String(raw || '').replace(/[٠-٩]/g, c => String('٠١٢٣٤٥٦٧٨٩'.indexOf(c))).replace(/[۰-۹]/g, c => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(c)));
+  t = normalizeArabicCommand(t).replace(/^(?:الشيء|شيء|حاجه|الحاجه)\s+/, '').replace(/^رقم\s+/, '').trim();
+  if (!t) return null;
+  if (/^\d{1,4}$/.test(t)) return parseInt(t, 10);
+  let total = 0, any = false;
+  for (let w of t.split(' ')) {
+    if (!w || w === 'و') continue;
+    if (!(w in SPOKEN_NUM) && w.startsWith('و') && (w.slice(1) in SPOKEN_NUM)) w = w.slice(1);
+    if (!(w in SPOKEN_NUM)) return null;
+    total += SPOKEN_NUM[w]; any = true;
+  }
+  return any ? total : null;
+}
+// يحوّل ما قاله المستخدم إلى مرجع: رقم، آخر/أول شيء، «هذا» (بالكاميرا)، أو اسم (بمطابقة تقريبية لا تُقبل إلا إذا كانت وحيدة).
+function resolveItemRef(items, raw) {
+  const n = normalizeArabicCommand(raw);
+  if (!n) return { kind: 'empty' };
+  if (/^(?:ده|دي|دا|هذا|هذه|هاذا|هاذه|الشيء الذي امامي|اللي قدامي|اللي امامي|اللي قدام الكاميرا|الي قدامي)$/.test(n)) return { kind: 'pointer' };
+  if (/^(?:اخر|الاخير|اخير)(?:\s+(?:شيء|حاجه|واحد|شي))?$/.test(n) || /^اخر شيء (?:علمتك|حفظته|سجلته)$/.test(n)) return items.length ? { kind: 'index', idx: items.length - 1 } : { kind: 'none' };
+  if (/^(?:اول|الاول)(?:\s+(?:شيء|حاجه|واحد|شي))?$/.test(n)) return items.length ? { kind: 'index', idx: 0 } : { kind: 'none' };
+  if (/^(?:(?:الشيء|شيء|الحاجه|حاجه)\s+)?رقم\s+\S/.test(n) || /^[\d٠-٩]+$/.test(raw.trim())) {
+    const num = parseSpokenNumber(n);
+    if (num == null) return { kind: 'badnumber' };
+    if (num < 1 || num > items.length) return { kind: 'range', n: num, count: items.length };
+    return { kind: 'index', idx: num - 1 };
+  }
+  const it = matchPersonalByName(items, raw);
+  if (it) return { kind: 'index', idx: items.indexOf(it) };
+  if (personalAmbiguous) return { kind: 'ambiguous', names: personalAmbiguous.slice() };
+  return { kind: 'none' };
+}
+
+let lastDeleted = null; // { item, idx, at } — للتراجع خلال 30 ثانية
+const UNDO_MS = 30000;
+async function undoDelete() {
+  if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
+  if (!lastDeleted) { const m = 'لا يوجد حذف حديث للتراجع عنه.'; updateStatus(m); speak(m); return; }
+  if (Date.now() - lastDeleted.at > UNDO_MS) { lastDeleted = null; const m = 'انتهت مهلة التراجع وهي ثلاثون ثانية.'; updateStatus(m); speak(m); return; }
+  isProcessing = true;
+  try {
+    const items = await loadPersonalItems();
+    if (personalLoadFailed) { await speakWait('تعذرت قراءة أشيائك الآن، ولم أتراجع عن شيء.'); return; }
+    const d = lastDeleted;
+    if (items.length >= PERSONAL_MAX_ITEMS) { await speakWait('لا مكان لإعادته لأنك وصلت للحد الأقصى.'); return; }
+    if (items.some(it => normalizeArabicCommand(it.name) === normalizeArabicCommand(d.item.name))) { await speakWait('يوجد الآن شيء بنفس اسم ' + d.item.name + '، فلم أعده حتى لا يختلط الأمر.'); lastDeleted = null; return; }
+    const at = Math.min(d.idx, items.length);
+    items.splice(at, 0, d.item);
+    if (!(await idbSet('items', items))) { items.splice(at, 1); await speakWait('تعذر حفظ التراجع في الهاتف. لم أُعد شيئاً.'); return; }
+    lastDeleted = null;
+    const m = 'تمت إعادة ' + d.item.name + '.'; updateStatus(m); await speakWait(m);
+  } catch (e) { speak('حدث خطأ أثناء التراجع.'); }
+  finally { isProcessing = false; isListening = false; }
+}
+async function speakItemNumber(ref) {
+  const items = await loadPersonalItems();
+  if (personalLoadFailed) { speak('تعذرت قراءة أشيائك الآن.'); return; }
+  const r = resolveItemRef(items, ref);
+  const m = r.kind === 'index' ? ('رقم ' + (r.idx + 1) + ' هو ' + items[r.idx].name + '.')
+    : r.kind === 'range' ? ('عندك ' + r.count + ' شيء فقط، ولا يوجد رقم ' + r.n + '.')
+    : 'لم أفهم الرقم. قل مثلاً: ما اسم رقم خمسة.';
+  updateStatus(m); speak(m);
+}
+
+const LIST_PAGE = 5;
 async function listPersonal() {
   if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
   isProcessing = true; stopVoiceRecognition();
-  let wantDelete = false;
+  let deleteRef = null;
   try {
     const items = await loadPersonalItems();
+    if (personalLoadFailed) { await speakWait('تعذرت قراءة أشيائك المحفوظة الآن. أغلق التطبيق وافتحه من جديد.'); return; }
     if (!items.length) { const m = 'لا توجد أشياء محفوظة.'; updateStatus(m); speak(m); return; }
-    const m = 'أشياؤك المحفوظة: ' + items.map(i => i.name).join('، ') + '.';
-    updateStatus(m);
-    await speakWait(m + ' هل تريد حذف شيء منها؟ انتظر نغمتين من الميكروفون ثم قل نعم أو لا.');
-    wantDelete = isYes(await listenOnce(6000));
+    updateStatus('أشياؤك المحفوظة: ' + items.length);
+    await speakWait('عندك ' + items.length + ' شيء. سأقرؤها خمسة خمسة، من الأحدث، ومع كل شيء رقمه. الأرقام تتغير بعد أي حذف.');
+    let start = items.length, misses = 0;
+    while (start > 0) {
+      const end = Math.max(0, start - LIST_PAGE), more = end > 0, part = [];
+      for (let i = start - 1; i >= end; i--) part.push('رقم ' + (i + 1) + '، ' + items[i].name);
+      await speakWait(part.join('. ') + '. ' + (more ? 'للمزيد قل التالي. ' : 'انتهت القائمة. ') + 'لحذف شيء قل احذف ثم رقمه. للإنهاء قل خلاص. انتظر نغمتين من الميكروفون.');
+      const ans = (await listenOnce(7000)).trim(), a = normalizeArabicCommand(ans);
+      if (!a) { await speakWait('لم أسمع شيئاً. أنهيت القراءة.'); break; }
+      if (/^(?:خلاص|كفايه|كفايه كده|انهاء|انهي|لا|توقف|بس|تمام)$/.test(a)) break;
+      if (more && (/^(?:التالي|التاليه|كمل|اكمل|المزيد|زياده|ايوه|نعم|اه)$/.test(a) || isYes(ans))) { start = end; misses = 0; continue; }
+      const dl = a.match(/^(?:احذف|امسح|حذف)\s*(.*)$/);
+      if (dl) { deleteRef = dl[1].trim(); break; }
+      if (++misses >= 2) { await speakWait('لم أفهم. أنهيت القراءة.'); break; }
+      await speakWait('لم أفهم. سأعيد هذه الصفحة.');
+    }
   } catch (e) { speak('تعذر عرض أشيائك الآن.'); }
   finally { isProcessing = false; isListening = false; }
-  if (wantDelete) await deletePersonalFlow('');
+  if (deleteRef !== null) await deletePersonalFlow(deleteRef);
+}
+
+// «احذف هذا»: يتعرف على الشيء من الكاميرا بأشيائك أنت فقط، ولا يحذف قبل تأكيدك.
+async function pickItemByCamera(items) {
+  const q = probeFrameQuality();
+  if (!q || q.isLensCovered) { await speakWait('الكاميرا غير جاهزة أو مغطاة.'); return -1; }
+  if (q.isVeryDark) { await speakWait('المكان مظلم جداً للتعرف.'); return -1; }
+  if (!(await ensurePersonalModel())) { await speakWait('تعذر تجهيز النموذج.'); return -1; }
+  await speakWait('ثبّت الشيء أمام الكاميرا.'); await sleep(1500);
+  const d = decidePersonal(await embedFrame(), items);
+  if (d.kind === 'match') { const i = items.findIndex(it => it.name === d.name); if (i >= 0) return i; }
+  if (d.kind === 'ambiguous') await speakWait('قد يكون ' + d.a + ' أو ' + d.b + '، ولست متأكداً، فلن أحذف شيئاً. جرّب «احذف رقم» أو الاسم.');
+  else await speakWait('لم أتعرف على شيء من أشيائك أمام الكاميرا. جرّب «احذف رقم» أو الاسم.');
+  return -1;
 }
 async function deletePersonalFlow(nameRaw) {
   if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
   isProcessing = true; stopVoiceRecognition();
   try {
     const items = await loadPersonalItems();
+    if (personalLoadFailed) { await speakWait('تعذرت قراءة أشيائك المحفوظة، ولن أحذف شيئاً. أغلق التطبيق وافتحه من جديد.'); return; }
     if (!items.length) { const m = 'لا توجد أشياء محفوظة لحذفها.'; updateStatus(m); speak(m); return; }
-    let target = String(nameRaw || '').trim();
-    if (!target) {
-      await speakWait('أشياؤك المحفوظة: ' + items.map(i => i.name).join('، ') + '. انتظر نغمتين من الميكروفون، ثم انطق اسم الشيء الذي تريد حذفه.');
-      target = (await listenOnce()).trim();
-      if (!target) { await speakWait('لم أسمع اسماً. أعد المحاولة من زر أشيائي.'); return; }
+    let ref = String(nameRaw || '').trim();
+    if (!ref) {
+      await speakWait('أي شيء تحذف؟ قل رقمه، أو آخر شيء، أو اسمه، أو قل هذا ووجّه الكاميرا نحوه. انتظر نغمتين من الميكروفون ثم تكلم.');
+      ref = (await listenOnce()).trim().replace(/^(?:احذف|امسح|حذف)\s*/, '');
+      if (!ref) { await speakWait('لم أسمع. أعد المحاولة بقول: احذف ثم رقم الشيء.'); return; }
     }
-    const n = normalizeArabicCommand(target);
-    const exact = items.filter(it => normalizeArabicCommand(it.name) === n);
-    const partial = exact.length ? exact : items.filter(it => { const m = normalizeArabicCommand(it.name); return m.length >= 2 && n.length >= 2 && (m.includes(n) || n.includes(m)); });
-    if (!partial.length) { await speakWait('لم أجد شيئاً باسم ' + target + '.'); return; }
-    if (partial.length > 1) { await speakWait('وجدت أكثر من شيء بهذا الاسم: ' + partial.map(i => i.name).join('، ') + '. أعد المحاولة وانطق الاسم كاملاً.'); return; }
-    const victim = partial[0];
-    await speakWait('هل تريد حذف ' + victim.name + '؟ انتظر نغمتين من الميكروفون ثم قل نعم للحذف أو لا للإلغاء.');
+    const r = resolveItemRef(items, ref);
+    let idx = -1;
+    if (r.kind === 'index') idx = r.idx;
+    else if (r.kind === 'pointer') { idx = await pickItemByCamera(items); if (idx < 0) return; }
+    else if (r.kind === 'range') { await speakWait('عندك ' + r.count + ' شيء فقط، ولا يوجد رقم ' + r.n + '.'); return; }
+    else if (r.kind === 'badnumber') { await speakWait('لم أفهم الرقم. قل مثلاً: احذف رقم خمسة.'); return; }
+    else if (r.kind === 'ambiguous') { await speakWait('وجدت أكثر من شيء يشبه ذلك: ' + r.names.join('، ') + '. أعد المحاولة بالرقم أو بالاسم كاملاً.'); return; }
+    else { await speakWait('لم أجد شيئاً باسم ' + ref + '. يمكنك قول احذف رقم كذا.'); return; }
+    const victim = items[idx];
+    await speakWait('هل تريد حذف ' + victim.name + '، رقم ' + (idx + 1) + '؟ انتظر نغمتين من الميكروفون ثم قل نعم للحذف أو لا للإلغاء.');
     if (!isYes(await listenOnce())) { await speakWait('تم الإلغاء. لم يُحذف شيء.'); return; }
-    const idx = items.indexOf(victim); if (idx >= 0) items.splice(idx, 1);
-    const ok = await idbSet('items', items);
-    const m = ok ? ('تم حذف ' + victim.name + '.') : ('حُذف ' + victim.name + ' مؤقتاً فقط، وقد يعود عند إعادة فتح التطبيق.');
+    const cur = items.indexOf(victim);
+    if (cur < 0) { await speakWait('تغيّرت القائمة أثناء الانتظار. لم أحذف شيئاً.'); return; }
+    items.splice(cur, 1);
+    if (!(await idbSet('items', items))) { items.splice(cur, 0, victim); await speakWait('تعذر الحذف من الهاتف. لم يُحذف ' + victim.name + '.'); return; }
+    lastDeleted = { item: victim, idx: cur, at: Date.now() };
+    const m = 'تم حذف ' + victim.name + '. إن كان بالخطأ قل تراجع خلال ثلاثين ثانية.';
     updateStatus(m); await speakWait(m);
   } catch (e) { speak('حدث خطأ أثناء الحذف.'); }
   finally { isProcessing = false; isListening = false; }
