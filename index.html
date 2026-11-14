@@ -166,7 +166,7 @@
           <div class="rounded-xl border border-indigo-700/80 bg-indigo-950/30 p-3 space-y-2">
             <strong class="block text-base text-indigo-200">🦇 معايرة وطواط الظلام (تجريبي — ثانية واحدة)</strong>
             <p class="text-gray-300 text-xs leading-relaxed">
-              ميزة تجريبية تعتمد على خصائص سماعة كل هاتف. وجّه الهاتف نحو <strong>فضاء مفتوح</strong> (بعيداً عن أي حائط بأكثر من 3 أمتار، بدون سماعة أذن وبرفع صوت الوسائط 70%) واضغط الزر لحفظ بصمة سماعة هاتفك. لا تعتمد عليها وحدها في التنقل.
+              ميزة تجريبية تعتمد على خصائص سماعة كل هاتف. وجّه الهاتف نحو <strong>فضاء مفتوح</strong> (بعيداً عن أي حائط بأكثر من 3 أمتار، بدون سماعة أذن وبرفع صوت الوسائط 70%) واضغط الزر لحفظ بصمة سماعة هاتفك. المعايرة شرط لتشغيل الوطواط، ولا يعمل الوطواط أبداً مع سماعة أذن متصلة. لا تعتمد عليه وحده في التنقل.
             </p>
             <div class="flex gap-2">
               <button id="calibrate-sonar-btn" type="button" onclick="calibrateBatSonarOpenAir()"
@@ -641,8 +641,8 @@ const colorBtnLabel = document.getElementById('color-btn-label');
 function updateSonarCalStatusText() {
   if (!sonarCalStatus) return;
   sonarCalStatus.textContent = sonarCalibration
-    ? '✅ الهاتف معايَر في الفضاء المفتوح وجاهز لرصد الحوائط والأبواب بدقة عالية.'
-    : 'لم يُعاير بعد (يعمل تلقائياً الآن، ولكن المعايرة ترفع دقة المسافات القريبة أقل من نصف متر).';
+    ? (sonarCalibration.directPeak > 0 ? '✅ الهاتف معايَر في الفضاء المفتوح.' : '⚠ معايرة قديمة؛ أعد المعايرة ليعمل الوطواط.')
+    : '⚠ لم يُعاير بعد. الوطواط لا يعمل قبل المعايرة، ولا يعمل أبداً مع سماعة أذن متصلة.';
 }
 updateSonarCalStatusText();
 
@@ -888,6 +888,37 @@ async function withAutoTorchForCapture(fn) {
    - تمديد التسجيل +420ms لالتقاط كل النبضات على أجهزة أندرويد البطيئة
    - كاشف SO-CFAR (أصغر الخلفيتين) + صعود حقيقي فوق ما قبل القمة >= 1.65x
 ============================================================================ */
+/* ===== بوابة أمان الوطواط: لا نبضات عند سماعة/جهاز صوت خارجي، ولا عند تعذر التحقق من مسار الصوت =====
+   الطبقات: (1) أسماء أجهزة الصوت (مساعدة فقط؛ لم يثبت أن Chrome أندرويد يعرضها بموثوقية)،
+   (2) فحص ذاتي مطلق: الصوت المباشر يجب ألا يقل عن نصف ما سُجّل وقت المعايرة في الفضاء المفتوح،
+   (3) كتم 60 ثانية بعد أي فشل (يُلغى عند تغيّر أجهزة الصوت). */
+const EXTERNAL_AUDIO_RE = /(bluetooth|headset|headphone|earphone|earbud|airpod|\bbuds?\b|wired|usb|hands[\s-]?free|سماع|بلوتوث)/i;
+const SONAR_BLOCK_MS = 60000, SONAR_MIN_DIRECT_FRACTION = 0.5, SONAR_MIN_SNR = 4.5;
+let sonarBlockedUntil = 0, sonarLastBlockReason = 'weak';
+const SONAR_EARPHONE_MSG = 'الوطواط متوقف لأن سماعة أو جهاز صوت خارجي متصل. الوطواط يُصدر نبضات صوتية من سماعة الهاتف ويلتقط صداها بالميكروفون. مع سماعة الأذن يخرج الصوت في أذنك فلا يصل للميكروفون، فيستحيل رصد الصدى. افصل السماعة ثم أعد المحاولة.';
+const SONAR_NOCAL_MSG = 'الوطواط يحتاج معايرة قصيرة أولاً ليتأكد أن الصوت يصل للميكروفون. افتح الإعدادات وعاير الهاتف في مكان مفتوح بلا سماعة أذن، ثم أعد المحاولة.';
+const SONAR_WEAK_MSG = 'الوطواط متوقف لأن الصوت الواصل للميكروفون أضعف من وقت المعايرة. غالباً سماعة أذن متصلة، أو صوت الوسائط منخفض، أو شيء يغطي السماعة أو الميكروفون. افصل السماعة وارفع صوت الوسائط ثم أعد المحاولة.';
+try { navigator.mediaDevices?.addEventListener?.('devicechange', () => { sonarBlockedUntil = 0; }); } catch (e) {}
+async function sonarRouteCheck(audioTrack) {
+  const labels = [];
+  try { if (audioTrack?.label) labels.push(audioTrack.label); } catch (e) {}
+  try { (await navigator.mediaDevices.enumerateDevices()).forEach(d => { if ((d.kind === 'audiooutput' || d.kind === 'audioinput') && d.label) labels.push(d.label); }); } catch (e) {}
+  const hit = labels.find(l => EXTERNAL_AUDIO_RE.test(l));
+  return hit ? { ok: false, reason: 'external', label: hit } : { ok: true };
+}
+// بعد الفحص الذاتي: يقرّر هل نصدق أن النبضات خرجت من سماعة الهاتف ووصلت لميكروفونه.
+function sonarSelfTestGate(res, cal) {
+  if (!res || !(res.directSnr >= SONAR_MIN_SNR)) return { ok: false, reason: 'weak' };
+  if (!cal || !(cal.directPeak > 0) || cal.fs !== res.fs) return { ok: false, reason: 'nocal' };
+  if (!(res.directPeakMed >= cal.directPeak * SONAR_MIN_DIRECT_FRACTION)) return { ok: false, reason: 'weak' };
+  return { ok: true };
+}
+function sonarBlockMessage(reason, aecForcedOn) {
+  if (reason === 'external') return SONAR_EARPHONE_MSG;
+  if (reason === 'nocal') return SONAR_NOCAL_MSG;
+  return aecForcedOn ? 'هذا الهاتف يفرض كتم الصدى على الميكروفون، فلا يعمل الوطواط عليه. اعتمد على الكشاف والعصا البيضاء.' : SONAR_WEAK_MSG;
+}
+
 async function captureSonarEnvelopeProfile() {
   const ctx = ensureAudioContext();
   if (!ctx) throw new Error('تعذر تهيئة الصوت.');
@@ -902,6 +933,9 @@ async function captureSonarEnvelopeProfile() {
     const audioTrack = micStream.getAudioTracks()[0];
     const trackSettings = audioTrack?.getSettings ? audioTrack.getSettings() : {};
     const aecForcedOn = trackSettings.echoCancellation === true;
+    // قبل أي نبضة: إن وُجدت سماعة/جهاز صوت خارجي نتوقف فوراً (النبضات مسموعة وقد تؤذي الأذن عبر السماعة)
+    const route = await sonarRouteCheck(audioTrack);
+    if (!route.ok) { const e = new Error('route'); e.sonarRoute = route; throw e; }
 
     const fs = ctx.sampleRate || 48000;
     const chirpDur = 0.0045;
@@ -1042,18 +1076,20 @@ async function calibrateBatSonarOpenAir() {
   updateSettingsStatus('جارٍ تسجيل بصمة هاتفك في الفضاء المفتوح...', true);
   try {
     const res = await captureSonarEnvelopeProfile();
-    if (res.directSnr < 4.5) {
+    if (res.directSnr < SONAR_MIN_SNR) {
       updateSettingsStatus('فشلت المعايرة: افصل سماعة الأذن وارفع صوت الوسائط قليلاً وأعد المحاولة.', true);
       return;
     }
     const ratios = [];
     for (let k = 0; k <= res.maxLag; k += 2) ratios.push(Number((res.medEnv[k] / Math.max(1e-6, res.directPeakMed)).toFixed(5)));
-    sonarCalibration = { fs: res.fs, step: 2, ratios, directSnr: res.directSnr };
+    sonarCalibration = { fs: res.fs, step: 2, ratios, directSnr: res.directSnr, directPeak: res.directPeakMed };
     writeLS(LS_SONAR_CAL, JSON.stringify(sonarCalibration));
+    sonarBlockedUntil = 0;
     updateSonarCalStatusText();
     updateSettingsStatus('تمت معايرة وطواط الظلام بنجاح لهاتفك!', true);
   } catch (e) {
-    updateSettingsStatus('تعذرت المعايرة: تأكد من منح إذن الميكروفون.', true);
+    if (e && e.sonarRoute) { updateSettingsStatus('توقفت المعايرة: ' + SONAR_EARPHONE_MSG, true); }
+    else updateSettingsStatus('تعذرت المعايرة: تأكد من منح إذن الميكروفون.', true);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '🦇 عاير الهاتف في فضاء مفتوح'; }
     isProcessing = false;
@@ -1079,16 +1115,20 @@ async function runBatSonarProbe() {
   if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
   isProcessing = true; hideRiskIndicator(); vibrate(40);
   stopSpeaking();
+  if (Date.now() < sonarBlockedUntil) { // كتم بعد فشل سابق: لا نبضات جديدة ولا إزعاج متكرر
+    const m = sonarBlockMessage(sonarLastBlockReason, false); updateRiskIndicator('تعذر التحقق'); updateStatus(m); speak(m); isProcessing = false; return;
+  }
   updateStatus('جارٍ فحص الصدى بوطواط الظلام... اصمت ثانية.');
   try {
     const res = await captureSonarEnvelopeProfile();
     const { fs, cSound, maxLag, directPeakMed, noiseFloor, directSnr, aecForcedOn, medEnv, envelopes } = res;
 
-    if (directSnr < 4.5) {
-      const m = aecForcedOn
-        ? 'هذا الهاتف يفرض كتم الصدى على الميكروفون؛ اعتمد على الكشاف والعصا البيضاء.'
-        : 'لم يصل صوت الاختبار للميكروفون بوضوح. افصل سماعة الأذن وارفع صوت الوسائط 70% ثم أعد الفحص.';
-      updateStatus(m); speak(m); return;
+    const gate = sonarSelfTestGate(res, sonarCalibration);
+    if (DEV_MODE) updateDebug('(معايرة) الوطواط: snr=' + directSnr.toFixed(1) + ' direct=' + directPeakMed.toFixed(4) + ' cal=' + (sonarCalibration?.directPeak ? sonarCalibration.directPeak.toFixed(4) : '—'));
+    if (!gate.ok) {
+      sonarLastBlockReason = gate.reason; sonarBlockedUntil = Date.now() + SONAR_BLOCK_MS;
+      const m = sonarBlockMessage(gate.reason, aecForcedOn);
+      updateRiskIndicator('تعذر التحقق'); vibrate([80, 60, 80]); updateStatus(m); speak(m); return;
     }
 
     const env = new Float32Array(medEnv.length);
@@ -1186,7 +1226,9 @@ async function runBatSonarProbe() {
     }
     lastDescription = msg; updateStatus(msg); speak(msg);
   } catch (e) {
-    const m = 'تعذر تشغيل وطواط الظلام. تأكد من منح إذن الميكروفون.';
+    let m;
+    if (e && e.sonarRoute) { sonarLastBlockReason = 'external'; sonarBlockedUntil = Date.now() + SONAR_BLOCK_MS; m = SONAR_EARPHONE_MSG; updateRiskIndicator('تعذر التحقق'); vibrate([80, 60, 80]); }
+    else m = 'تعذر تشغيل وطواط الظلام. تأكد من منح إذن الميكروفون.';
     updateStatus(m); speak(m);
   } finally { isProcessing = false; }
 }
