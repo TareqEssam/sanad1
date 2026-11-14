@@ -50,7 +50,7 @@
 <div id="report" class="box">لم يُجرَ بعد.</div>
 
 <script>
-const MODEL_ID = 'Xenova/dinov2-small:q8', DIM = 768, VECTOR_DIM = DIM * 2, MAX_PROTOS = 8, MIN_IMAGES = 3;
+const MODEL_ID = 'Xenova/dinov2-small:q8', DIM = 768, MAX_PROTOS = 8, MIN_IMAGES = 3;
 const KINDS = ['hazard', 'place', 'object', 'background'];
 const $ = id => document.getElementById(id);
 $('pack-version').value = new Date().toISOString().slice(0, 10).replace(/-/g, '.');
@@ -82,11 +82,10 @@ async function embedFile(file) {
   try { bmp.close(); } catch (e) {}
   const out = await extractor(c.toDataURL('image/jpeg', 0.9));
   const dims = out.dims, D = dims[dims.length - 1], N = dims.length >= 3 ? dims[dims.length - 2] : 1, d = out.data;
-  if (D !== DIM || !Number.isFinite(N) || N < 1 || d.length < D * N) throw new Error('خرج DINOv2 غير متوافق مع الأبعاد المتوقعة');
   const cls = normVec(d.slice(0, D)), mean = new Float32Array(D);
   if (N > 1) { for (let t = 1; t < N; t++) for (let i = 0; i < D; i++) mean[i] += d[t * D + i] / (N - 1); }
-  const both = new Float32Array(VECTOR_DIM); both.set(cls, 0); both.set(normVec(N > 1 ? mean : cls), D);
-  if (both.length !== VECTOR_DIM) throw new Error('طول البصمة النهائية غير صحيح');
+  const both = new Float32Array(2 * D); both.set(cls, 0); both.set(normVec(N > 1 ? mean : cls), D);
+  if (both.length !== DIM) { const e = new Error('طول البصمة ' + both.length + ' لا يساوي DIM=' + DIM + ' — النموذج لا يطابق التطبيق. أوقفت البناء.'); e.dimMismatch = true; throw e; }
   return normVec(both);
 }
 
@@ -110,7 +109,6 @@ function pickPrototypes(vecs, k) {
 }
 
 function encodeVec(v) {
-  if (!v || v.length !== VECTOR_DIM) throw new Error('لا يمكن ضغط بصمة بطول غير متوافق');
   let mx = 0; for (let i = 0; i < v.length; i++) mx = Math.max(mx, Math.abs(v[i]));
   const s = (mx || 1e-6) / 127, q = new Int8Array(v.length);
   for (let i = 0; i < v.length; i++) q[i] = Math.max(-127, Math.min(127, Math.round(v[i] / s)));
@@ -150,7 +148,7 @@ $('build-btn').addEventListener('click', async () => {
       if (list.length < MIN_IMAGES) { log('⚠ تجاهل «' + folder + '»: ' + list.length + ' صورة فقط (الحد الأدنى ' + MIN_IMAGES + ').'); continue; }
       log('تضمين «' + folder + '» (' + list.length + ' صورة)...');
       const vecs = [];
-      for (const f of list) { try { vecs.push(await embedFile(f)); } catch (err) { log('  تعذرت صورة: ' + f.name); } }
+      for (const f of list) { try { vecs.push(await embedFile(f)); } catch (err) { if (err && err.dimMismatch) throw err; log('  تعذرت صورة: ' + f.name); } }
       if (vecs.length < MIN_IMAGES) continue;
       vecs.forEach(v => all.push({ cls: info.name, kind: info.kind, vec: v }));
       classes.push({ info, vecs });
@@ -179,7 +177,7 @@ $('build-btn').addEventListener('click', async () => {
     $('report').innerHTML = html;
 
     builtPack = {
-      format: 1, model: MODEL_ID, dim: DIM, vector_dim: VECTOR_DIM,
+      format: 1, model: MODEL_ID, dim: DIM,
       id: ($('pack-id').value || 'pack').trim(), name: ($('pack-name').value || 'حزمة').trim(), version: ($('pack-version').value || '0').trim(),
       built: new Date().toISOString(),
       classes: classes.map(c => ({ id: c.info.name, name: c.info.name, kind: c.info.kind, vecs: pickPrototypes(c.vecs, MAX_PROTOS).map(encodeVec) }))

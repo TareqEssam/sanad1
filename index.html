@@ -8,7 +8,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" type="image/png" href="icon-192.png">
   <link rel="apple-touch-icon" href="icon-192.png">
-  <title>سند V20.5 — المرحلة الأولى (نسخة تطوير)</title>
+  <title>سند V20.3 — إصلاحات سلامة + وطواط تجريبي</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
@@ -135,7 +135,7 @@
   <main id="settings-screen" class="p-4 flex flex-col min-h-screen max-w-xl mx-auto w-full" role="main" aria-labelledby="settings-heading">
     <div class="w-full flex flex-col gap-4 pb-10">
       <h1 id="settings-heading" tabindex="-1" class="text-2xl font-bold text-center text-blue-400">
-        سند V20.5 — نسخة تطوير المرحلة الأولى
+        سند V20.2 — المساعد البصري الشامل المجاني
       </h1>
       <p class="text-sm text-gray-200 leading-relaxed">
         مشروع إنساني مجاني بالكامل لفاقدي وضعاف البصر في مصر: يعمل <strong>بلا تكلفة أو بطاقة بنكية</strong>. يجمع بين الرؤية المحلية (المسافة بالخطوات، تحذير الاقتراب السريع، الكشاف التلقائي في الظلام، <strong>وطواط الظلام (تجريبي)</strong> لكشف الحوائط والأبواب المغلقة، قراءة النصوص وصلاحية الدواء، العملة المصرية، فحص البقع وتنسيق الملابس، ومدرب توجيه المرآة) + دعم الخادم المجاني ومفاتيح Gemini 3 و OpenRouter المجانية.
@@ -755,7 +755,10 @@ function playAckTone() {
   } catch (e) {}
 }
 function vibrate(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+// أرقام المعايرة التشخيصية تظهر فقط في وضع المطوّر (?dev=1) كي لا يقرأها قارئ الشاشة للمستخدم الكفيف.
+const DEV_MODE = (() => { try { return new URLSearchParams(location.search).get('dev') === '1'; } catch (e) { return false; } })();
 function updateStatus(t) { statusText.innerText = t; }
+function updateDebug(t) { if (DEV_MODE) statusText.innerText = t; }
 function updateRiskIndicator(level) {
   riskIndicator.className = 'border rounded-xl px-3 py-1 text-xs';
   riskIndicator.classList.remove('hidden', 'risk-danger', 'risk-caution', 'risk-none', 'risk-unknown');
@@ -1593,7 +1596,9 @@ function detectExpiryWarning(rawText) {
     return { mm, yy, day: day ? parseInt(day, 10) : null };
   }
   function fmt(d) { return d.day ? (d.day + '/' + d.mm + '/' + d.yy) : (d.mm + '/' + d.yy); }
-  function isExpired(d) { return d.yy < cy || (d.yy === cy && d.mm < cm); }
+  const cd = now.getDate();
+  // بلا يوم: ينتهي بنهاية الشهر. مع يوم: ينتهي قبل اليوم الحالي (يوم الانتهاء نفسه يُعد صالحاً).
+  function isExpired(d) { return d.yy < cy || (d.yy === cy && (d.mm < cm || (d.mm === cm && d.day != null && d.day < cd))); }
 
   // Collect candidate dates near cues
   const candidates = [];
@@ -1616,7 +1621,9 @@ function detectExpiryWarning(rawText) {
   const monRe = /(?:exp|ex|انتهاء|صلاحية|mfg|prd|إنتاج)?[^\w\u0600-\u06FF]{0,8}(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يوليو|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)\s*[\/\-\s]?(20\d{2}|\d{2})/ig;
   while ((m = monRe.exec(t)) !== null) {
     const mon = monthMap[m[1].toLowerCase()];
-    if (mon) {
+    // تاريخ مسبوق بعلامة إنتاج (MFG/PRD/إنتاج) ليس تاريخ صلاحية؛ لا يدخل المرشحين.
+    const isMfgDate = /(mfg|prd|إنتاج)/i.test(m[0].slice(0, m[0].toLowerCase().indexOf(m[1].toLowerCase())));
+    if (mon && !isMfgDate) {
       const d = parseDateParts(mon, m[2]);
       if (d) candidates.push({ d, score: hasExpCue ? 2 : 1, source: 'month' });
     }
@@ -1637,7 +1644,9 @@ function detectExpiryWarning(rawText) {
     return '';
   }
   // Prefer highest score, then latest date
-  candidates.sort((a,b) => b.score - a.score || (b.d.yy - a.d.yy) || (b.d.mm - a.d.mm));
+  // الأعلى ثقةً أولاً؛ وعند تعدد التواريخ بنفس الثقة نختار الأقدم (الأحوط) لا الأحدث.
+  const dkey = x => x.d.yy * 10000 + x.d.mm * 100 + (x.d.day || 0);
+  candidates.sort((a,b) => b.score - a.score || dkey(a) - dkey(b));
   const best = candidates[0].d;
   // If strong production cue and weak expiry, be more cautious
   if (hasMfgCue && !hasExpCue && candidates[0].score < 2) {
@@ -1968,7 +1977,7 @@ async function callOpenRouterWithFailover(b64, promptText) {
 
 function getSpeechRecognitionConstructor() { return window.SpeechRecognition || window.webkitSpeechRecognition || null; }
 function stopVoiceRecognition() { if (recognition) { try { recognition.onresult = null; recognition.onerror = null; recognition.onend = null; recognition.stop(); } catch (e) {} } recognition = null; isListening = false; }
-function normalizeArabicCommand(t) { return String(t || '').normalize('NFKC').toLowerCase().replace(/[\u064B-\u065F\u0670ـ]/g, '').replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660)).replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06F0)).replace(/[؟?!،,.؛:]/g, ' ').replace(/\s+/g, ' ').trim(); }
+function normalizeArabicCommand(t) { return String(t || '').normalize('NFKC').toLowerCase().replace(/[\u064B-\u065F\u0670ـ]/g, '').replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/[؟?!،,.؛:]/g, ' ').replace(/\s+/g, ' ').trim(); }
 function parseVoiceCommand(raw) {
   const n = normalizeArabicCommand(raw).replace(/^(يا سند|من فضلك|لو سمحت|ممكن)\s+/, '').trim();
   if (!n) return null;
@@ -2051,8 +2060,7 @@ async function findObjectLive(targetRaw) {
     }
     if (hasCloudVision()) { isProcessing = false; await captureAndAnalyze('هل ترى «' + targetRaw + '»؟ أين مكانه وكم يبعد بالخطوات؟'); return; }
     const m = 'لم أجد «' + targetRaw + '» أمامي الآن.'; updateStatus(m); speak(m);
-  } catch (e) { const m = 'تعذر البحث في أشيائك أو حزم المعرفة بسبب مشكلة في التخزين. لم أغيّر بياناتك.'; updateStatus(m); speak(m); }
-  finally { isProcessing = false; }
+  } finally { isProcessing = false; }
 }
 
 async function handleVoiceCommand(cmd) {
@@ -2171,13 +2179,12 @@ async function startApp(fromUserGesture) {
 
 
 /* ============================================================================
-   أشيائي (V20.5): تعليم الهاتف أشياء شخصية — كله على الهاتف، لا يُرسل شيء.
+   أشيائي (V20.4): تعليم الهاتف أشياء شخصية — كله على الهاتف، لا يُرسل شيء.
    النموذج: DINOv2-small (Xenova/dinov2-small عبر Transformers.js) لاستخراج بصمة رقمية
    للصورة، ثم مقارنة بالأقرب (cosine). تُخزَّن البصمات فقط (لا الصور) في IndexedDB.
    الحدود أدناه قيم ابتدائية تحتاج معايرة على أشياء حقيقية.
 ============================================================================ */
-const PERSONAL_MIN_SIM = 0.55, PERSONAL_MARGIN = 0.05, PERSONAL_LOOKALIKE = 0.85, PERSONAL_MAX_ITEMS = 100, PERSONAL_MAX_SHOTS = 6;
-const PERSONAL_MODEL_DIM = 768, PERSONAL_VECTOR_DIM = PERSONAL_MODEL_DIM * 2;
+const PERSONAL_MIN_SIM = 0.55, PERSONAL_MARGIN = 0.05, PERSONAL_LOOKALIKE = 0.85, PERSONAL_MAX_ITEMS = 500, PERSONAL_MAX_SHOTS = 6;
 let personalExtractor = null, personalLoading = null, personalItems = null;
 
 /* ============================================================================
@@ -2188,8 +2195,7 @@ let personalExtractor = null, personalLoading = null, personalItems = null;
    حدود التشابه ابتدائية وتحتاج معايرة على صور حقيقية.
 ============================================================================ */
 const GENERAL_MIN_SIM = 0.55, GENERAL_MARGIN = 0.04;
-// dim هو بُعد خرج النموذج الأساسي؛ PACK_DIM هو طول البصمة المدمجة (CLS + mean).
-const PACK_MODEL_ID = 'Xenova/dinov2-small:q8', PACK_MODEL_DIM = 768, PACK_DIM = 1536, PACK_MAX_BYTES = 15 * 1024 * 1024;
+const PACK_MODEL_ID = 'Xenova/dinov2-small:q8', PACK_DIM = 768, PACK_MAX_BYTES = 15 * 1024 * 1024;
 const PACK_KINDS = ['hazard', 'place', 'object', 'background'];
 let installedPacks = null, generalClasses = [];
 
@@ -2203,16 +2209,15 @@ function decodePackVec(e) {
   return normVec(out);
 }
 function validatePack(p) {
-  if (!p || p.format !== 1 || p.model !== PACK_MODEL_ID || p.dim !== PACK_MODEL_DIM || (p.vector_dim != null && p.vector_dim !== PACK_DIM) || !Array.isArray(p.classes)) throw new Error('حزمة غير متوافقة مع نموذج التطبيق');
+  if (!p || p.format !== 1 || p.model !== PACK_MODEL_ID || p.dim !== PACK_DIM || !Array.isArray(p.classes)) throw new Error('حزمة غير متوافقة مع نموذج التطبيق');
   const classes = [];
   for (const c of p.classes.slice(0, 400)) {
     const name = packClean(c && c.name, 60); if (!name || !Array.isArray(c.vecs) || !c.vecs.length) continue;
     const vecs = [];
-    for (const e of c.vecs.slice(0, 12)) vecs.push(decodePackVec(e));
+    for (const e of c.vecs.slice(0, 12)) { try { vecs.push(decodePackVec(e)); } catch (err) {} }
     if (vecs.length) classes.push({ name, kind: PACK_KINDS.includes(c.kind) ? c.kind : 'object', vecs });
   }
   if (!classes.length) throw new Error('الحزمة فارغة أو تالفة');
-  if (classes.length !== p.classes.filter(c => c && packClean(c.name, 60) && Array.isArray(c.vecs) && c.vecs.length).slice(0, 400).length) throw new Error('تحتوي الحزمة على بصمات تالفة أو غير متوافقة');
   return { id: packClean(p.id, 60) || 'pack', name: packClean(p.name, 60) || 'حزمة', version: packClean(p.version, 30) || '0', classes };
 }
 function rebuildGeneralClasses() {
@@ -2221,19 +2226,19 @@ function rebuildGeneralClasses() {
 }
 async function loadInstalledPacks() {
   if (!installedPacks) {
-    const stored = await idbGet('packs');
-    installedPacks = Array.isArray(stored) ? stored : [];
-    rebuildGeneralClasses();
+    const r = await idbGetStrict('packs');
+    if (!r.ok) return []; // فشلت القراءة: لا نخزّن قائمة فارغة في الذاكرة حتى لا تُكتب فوق الحزم المحفوظة
+    installedPacks = r.value || []; rebuildGeneralClasses();
   }
   return installedPacks;
 }
 async function installPack(obj) {
-  const v = validatePack(obj), current = await loadInstalledPacks();
-  const packs = current.map(p => p.id === v.id ? v : p);
-  if (!current.some(p => p.id === v.id)) packs.push(v);
-  const saved = await idbSet('packs', packs);
-  if (saved) { installedPacks = packs; rebuildGeneralClasses(); }
-  return { pack: v, saved };
+  const v = validatePack(obj), packs = await loadInstalledPacks();
+  if (!installedPacks) throw new Error('تعذرت قراءة الحزم المثبتة؛ لم أكتب فوقها.');
+  const i = packs.findIndex(p => p.id === v.id);
+  if (i >= 0) packs[i] = v; else packs.push(v);
+  rebuildGeneralClasses();
+  return { pack: v, saved: await idbSet('packs', packs) };
 }
 function rankPool(q, pool) {
   return pool.map(c => ({ name: c.name, kind: c.kind, score: Math.max(...c.vecs.map(v => dotVec(q, v))) })).sort((a, b) => b.score - a.score);
@@ -2260,12 +2265,10 @@ const updatePacksBtn = document.getElementById('update-packs-btn');
 packsUrlInput.value = readLS(LS_PACKS_URL, DEFAULT_PACKS_MANIFEST_URL);
 function setPacksStatus(m) { packsStatus.textContent = m; updateSettingsStatus(m, true); }
 async function renderPacksList() {
+  const packs = await loadInstalledPacks();
   packsListEl.innerHTML = '';
-  try {
-    const packs = await loadInstalledPacks();
-    if (!packs.length) { const li = document.createElement('li'); li.textContent = 'لا توجد حزم مثبتة.'; packsListEl.appendChild(li); return; }
-    for (const p of packs) { const li = document.createElement('li'); li.textContent = p.name + ' — إصدار ' + p.version + ' — ' + p.classes.length + ' صنف'; packsListEl.appendChild(li); }
-  } catch (e) { const li = document.createElement('li'); li.textContent = 'تعذر قراءة الحزم المحفوظة. لم يتم تغيير بياناتك.'; packsListEl.appendChild(li); }
+  if (!packs.length) { const li = document.createElement('li'); li.textContent = 'لا توجد حزم مثبتة.'; packsListEl.appendChild(li); return; }
+  for (const p of packs) { const li = document.createElement('li'); li.textContent = p.name + ' — إصدار ' + p.version + ' — ' + p.classes.length + ' صنف'; packsListEl.appendChild(li); }
 }
 function resolvePackUrl(u, base) {
   const url = new URL(u, base || location.href);
@@ -2320,56 +2323,45 @@ importPackInput.addEventListener('change', async () => {
 });
 async function clearInstalledPacks() {
   if (!window.confirm('حذف كل حزم المعرفة العامة؟ أشياؤك الخاصة لن تُحذف.')) return;
+  installedPacks = []; rebuildGeneralClasses();
   const ok = await idbSet('packs', []);
-  if (ok) { installedPacks = []; rebuildGeneralClasses(); }
   await renderPacksList();
-  setPacksStatus(ok ? 'حُذفت الحزم العامة. أشياؤك الخاصة سليمة.' : 'تعذر الحذف من التخزين؛ لم نعتمد التغيير.');
+  setPacksStatus(ok ? 'حُذفت الحزم العامة. أشياؤك الخاصة سليمة.' : 'تعذر الحذف من التخزين.');
 }
 renderPacksList();
 
 async function listGeneral() {
-  try {
-    const packs = await loadInstalledPacks();
-    const m = packs.length
-      ? ('المعرفة العامة المثبتة: ' + packs.map(p => p.name + ' (' + p.classes.length + ' صنف)').join('، ') + '.')
-      : 'لا توجد حزمة معرفة عامة مثبتة. نزّلها من الإعدادات.';
-    updateStatus(m); speak(m);
-  } catch (e) { const m = 'تعذر قراءة حزم المعرفة المحفوظة. لم يتم تغييرها.'; updateStatus(m); speak(m); }
+  const packs = await loadInstalledPacks();
+  const m = packs.length
+    ? ('المعرفة العامة المثبتة: ' + packs.map(p => p.name + ' (' + p.classes.length + ' صنف)').join('، ') + '.')
+    : 'لا توجد حزمة معرفة عامة مثبتة. نزّلها من الإعدادات.';
+  updateStatus(m); speak(m);
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function idbOpen() { return new Promise((res, rej) => { const q = indexedDB.open('sanad_personal', 1); q.onupgradeneeded = () => { if (!q.result.objectStoreNames.contains('kv')) q.result.createObjectStore('kv'); }; q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
-async function idbGet(k) { const db = await idbOpen(); try { return await new Promise((res, rej) => { const t = db.transaction('kv', 'readonly'), r = t.objectStore('kv').get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); t.onerror = () => rej(t.error); }); } finally { db.close(); } }
-async function idbSet(k, v) { let db; try { db = await idbOpen(); await new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('تم إلغاء معاملة التخزين')); }); return true; } catch (e) { return false; } finally { if (db) db.close(); } }
-function newPersonalItemId() {
-  try { if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID(); } catch (e) {}
-  return 'item-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
-}
-async function savePersonalItems(nextItems) {
-  const ok = await idbSet('items', nextItems);
-  if (ok) personalItems = nextItems;
-  return ok;
-}
+function idbOpen() { return new Promise((res, rej) => { const q = indexedDB.open('sanad_personal', 1); q.onupgradeneeded = () => q.result.createObjectStore('kv'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); }
+async function idbGet(k) { try { const db = await idbOpen(); return await new Promise((res, rej) => { const r = db.transaction('kv').objectStore('kv').get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); } catch (e) { return undefined; } }
+// الكتابة تُعد ناجحة فقط عند اكتمال المعاملة فعلاً (oncomplete)؛ الإجهاض (مثل امتلاء التخزين) يُرفض صراحةً ولا يُترك معلّقاً.
+async function idbSet(k, v) { try { const db = await idbOpen(); await new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = res; t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('aborted')); }); return true; } catch (e) { return false; } }
+// قراءة صارمة: تُرجع {ok:false} عند فشل القراءة نفسها، كي لا نخلط «لا بيانات» بـ«تعذرت القراءة» فنكتب فوق بيانات سليمة.
+async function idbGetStrict(k) { try { const db = await idbOpen(); return await new Promise((res, rej) => { const r = db.transaction('kv').objectStore('kv').get(k); r.onsuccess = () => res({ ok: true, value: r.result }); r.onerror = () => rej(r.error); }); } catch (e) { return { ok: false }; } }
+let personalLoadFailed = false;
 async function loadPersonalItems() {
-  if (personalItems) return personalItems;
-  const stored = await idbGet('items');
-  if (stored != null && !Array.isArray(stored)) throw new Error('صيغة أشيائي المحفوظة غير سليمة؛ لم نعد تهيئتها حتى لا نفقد البيانات');
-  const items = Array.isArray(stored) ? stored : [];
-  let migrated = false;
-  const seenIds = new Set();
-  for (const item of items) {
-    if (!item || typeof item !== 'object' || typeof item.name !== 'string' || !Array.isArray(item.vecs)) throw new Error('يوجد عنصر شخصي تالف؛ أوقفنا التعديل حفاظاً على بقية البيانات');
-    if (!item.vecs.length || item.vecs.length > PERSONAL_MAX_SHOTS * 2) throw new Error('عدد بصمات أحد الأشياء غير صالح؛ أوقفنا التعديل حفاظاً على البيانات');
-    for (const vec of item.vecs) {
-      if (!vec || vec.length !== PERSONAL_VECTOR_DIM) throw new Error('بُعد إحدى بصمات أشيائي غير متوافق؛ لم نغيّر البيانات');
-      for (let i = 0; i < vec.length; i++) if (!Number.isFinite(Number(vec[i]))) throw new Error('توجد بصمة تالفة؛ لم نغيّر البيانات');
-    }
-    if (typeof item.id !== 'string' || !item.id || seenIds.has(item.id)) { item.id = newPersonalItemId(); migrated = true; }
-    seenIds.add(item.id);
+  if (!personalItems) {
+    const r = await idbGetStrict('items');
+    if (!r.ok) { personalLoadFailed = true; return []; }
+    personalLoadFailed = false; personalItems = r.value || [];
   }
-  if (migrated && !(await idbSet('items', items))) throw new Error('تعذر ترقية بيانات أشيائي إلى الصيغة الجديدة؛ لم نسمح بتعديلها');
-  personalItems = items;
   return personalItems;
+}
+// مساحة التخزين المتبقية على الهاتف (تقديرية من المتصفح؛ قد لا تتوفر). null = غير معروف.
+async function storageHeadroom() {
+  try {
+    if (!navigator.storage || !navigator.storage.estimate) return null;
+    const e = await navigator.storage.estimate();
+    if (!e || !e.quota) return null;
+    return { free: e.quota - (e.usage || 0), ratio: (e.usage || 0) / e.quota };
+  } catch (err) { return null; }
 }
 
 function normVec(v) { let s = 0; for (let i = 0; i < v.length; i++) s += v[i] * v[i]; s = Math.sqrt(s) || 1; const o = new Float32Array(v.length); for (let i = 0; i < v.length; i++) o[i] = v[i] / s; return o; }
@@ -2470,10 +2462,9 @@ async function embedFrame(crop) {
   }
   const out = await personalExtractor(srcCanvas.toDataURL('image/jpeg', 0.9));
   const dims = out.dims, D = dims[dims.length - 1], N = dims.length >= 3 ? dims[dims.length - 2] : 1, d = out.data;
-  if (D !== PERSONAL_MODEL_DIM || !Number.isFinite(N) || N < 1 || d.length < D * N) throw new Error('خرج نموذج أشيائي غير متوافق مع الأبعاد المتوقعة');
   const cls = normVec(d.slice(0, D)), mean = new Float32Array(D);
   if (N > 1) { for (let t = 1; t < N; t++) for (let i = 0; i < D; i++) mean[i] += d[t * D + i] / (N - 1); }
-  const both = new Float32Array(PERSONAL_VECTOR_DIM); both.set(cls, 0); both.set(normVec(N > 1 ? mean : cls), D);
+  const both = new Float32Array(2 * D); both.set(cls, 0); both.set(normVec(N > 1 ? mean : cls), D);
   return normVec(both);
 }
 const MED_RE = /(دواء|دوا|حبوب|قرص|اقراص|شراب|علاج|حقن|مرهم|قطره|كبسول)/;
@@ -2482,7 +2473,16 @@ async function teachPersonal() {
   if (isProcessing) return; isProcessing = true; hideRiskIndicator();
   try {
     const items = await loadPersonalItems();
+    if (personalLoadFailed) { await speakWait('تعذرت قراءة أشيائك المحفوظة، ولن أحفظ شيئاً جديداً حتى لا أمحو ما عندك. أغلق التطبيق وافتحه من جديد.'); return; }
+    const exists0 = items.length;
+    if (exists0 >= PERSONAL_MAX_ITEMS) { await speakWait('وصلت للحد الأقصى وهو ' + PERSONAL_MAX_ITEMS + ' شيء. احذف شيئاً أولاً.'); return; }
+    const room = await storageHeadroom();
+    if (room && room.free < 20 * 1024 * 1024) { await speakWait('مساحة التخزين في الهاتف شبه ممتلئة، ولا أستطيع حفظ أشياء جديدة. أفرغ مساحة من الهاتف ثم أعد المحاولة.'); return; }
+    let spaceNote = '';
+    if (room && room.ratio > 0.8) spaceNote = ' تنبيه: ذاكرة الهاتف قاربت الامتلاء.';
+    else if (exists0 >= Math.floor(PERSONAL_MAX_ITEMS * 0.9)) spaceNote = ' تنبيه: اقتربت من الحد الأقصى لعدد الأشياء، وبقي ' + (PERSONAL_MAX_ITEMS - exists0) + ' فقط.';
     if (!(await ensurePersonalModel())) { speak('تعذر تجهيز النموذج. تأكد من الإنترنت وحاول مرة أخرى.'); return; }
+    if (spaceNote) await speakWait(spaceNote.trim());
     await speakWait('ضع الشيء أمام الكاميرا على بعد شبر. سأصوره أربع مرات، حرّكه قليلاً بين كل مرة.');
     const shots = []; let tries = 0;
     while (shots.length < 4 && tries++ < 10) {
@@ -2508,12 +2508,13 @@ async function teachPersonal() {
     if (!exist && items.length >= PERSONAL_MAX_ITEMS) { await speakWait('وصلت للحد الأقصى من الأشياء. احذف شيئاً أولاً.'); return; }
     await speakWait('سأحفظه باسم ' + name + '.' + warn + ' انتظر نغمتين من الميكروفون، ثم قل نعم للحفظ أو لا للإلغاء.');
     if (!isYes(await listenOnce())) { await speakWait('تم الإلغاء.'); return; }
-    const nextItems = items.map(it => ({ ...it, vecs: [...it.vecs] }));
-    const nextExist = exist ? nextItems.find(it => it.id === exist.id) : null;
-    if (nextExist) { nextExist.vecs = [...nextExist.vecs, ...shots].slice(-PERSONAL_MAX_SHOTS * 2); nextExist.updatedAt = new Date().toISOString(); }
-    else nextItems.push({ id: newPersonalItemId(), name, vecs: shots, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
-    const ok = await savePersonalItems(nextItems);
-    await speakWait(ok ? 'تم حفظ الشيء على هذا الهاتف.' : 'تعذر حفظ الشيء بشكل دائم. لم أعتمد التغيير؛ حاول مرة أخرى.');
+    const prevVecs = exist ? exist.vecs : null;
+    if (exist) exist.vecs = [...exist.vecs, ...shots].slice(-PERSONAL_MAX_SHOTS * 2); else items.push({ name, vecs: shots });
+    const ok = await idbSet('items', items);
+    if (!ok) { // فشلت الكتابة الفعلية: نتراجع في الذاكرة أيضاً كي لا نوهم المستخدم بأن الشيء محفوظ
+      if (exist) exist.vecs = prevVecs; else items.pop();
+      await speakWait('لم أستطع حفظ ' + name + ' في الهاتف. غالباً مساحة التخزين ممتلئة. أفرغ مساحة وأعد المحاولة.');
+    } else await speakWait('تم الحفظ.');
   } catch (e) { speak('حدث خطأ أثناء التعليم.'); }
   finally { isProcessing = false; isListening = false; }
 }
@@ -2533,7 +2534,7 @@ async function identifyPersonal() {
       const d = items.length ? decidePersonal(v, items) : { kind: 'unknown', r: [] };
       const g = generalClasses.length ? decideGeneral(v, generalClasses) : { kind: 'unknown', r: [] };
       const top2 = r => r.slice(0, 2).map(x => x.name + ' ' + x.score.toFixed(2)).join(' | ') || '—';
-      updateStatus('(معايرة) خاص: ' + top2(d.r) + ' ‖ عام: ' + top2(g.r));
+      updateDebug('(معايرة) خاص: ' + top2(d.r) + ' ‖ عام: ' + top2(g.r));
       let m;
       if (d.kind === 'match') m = 'أظنه ' + d.name + ' من أشيائك.' + (MED_RE.test(d.name) ? ' هذا تخمين بصري؛ تأكد من الاسم المكتوب قبل الاستعمال.' : '');
       else if (d.kind === 'ambiguous') m = 'قد يكون ' + d.a + ' أو ' + d.b + ' من أشيائك. لست متأكداً.';
@@ -2548,30 +2549,17 @@ async function identifyPersonal() {
 async function listPersonal() {
   if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
   isProcessing = true; stopVoiceRecognition();
-  let deleteTarget = '';
+  let wantDelete = false;
   try {
     const items = await loadPersonalItems();
     if (!items.length) { const m = 'لا توجد أشياء محفوظة.'; updateStatus(m); speak(m); return; }
-    const pageSize = 10;
-    let page = 0;
-    while (page * pageSize < items.length) {
-      const first = page * pageSize, shown = items.slice(first, first + pageSize);
-      const names = shown.map((item, i) => (first + i + 1) + ': ' + item.name).join('، ');
-      const prompt = 'لديك ' + items.length + ' شيئاً محفوظاً. أعرض الآن العناصر من ' + (first + 1) + ' إلى ' + (first + shown.length) + ': ' + names + '. قل التالي، أو السابق، أو انتهيت، أو احذف ثم اسم الشيء، أو احذف العنصر برقم ترتيبه في القائمة.';
-      updateStatus(prompt); await speakWait(prompt);
-      const answer = (await listenOnce(10000)).trim();
-      if (!answer) break;
-      const a = normalizeArabicCommand(answer);
-      if (['التالي', 'اللي بعده', 'بعد كده', 'اكمل'].includes(a)) { if ((page + 1) * pageSize < items.length) page++; else await speakWait('هذه آخر مجموعة.'); continue; }
-      if (['السابق', 'اللي قبله', 'ارجع'].includes(a)) { page = Math.max(0, page - 1); continue; }
-      if (['انتهيت', 'خلاص', 'لا', 'الغاء', 'إلغاء', 'توقف'].includes(a)) break;
-      const parsed = parseVoiceCommand(answer);
-      if (parsed && parsed.type === 'delMine' && parsed.target) { deleteTarget = parsed.target; break; }
-      await speakWait('لم أفهم الاختيار. قل التالي أو السابق أو انتهيت أو احذف ثم اسم الشيء أو رقم ترتيبه في القائمة.');
-    }
-  } catch (e) { const m = 'تعذر عرض أشيائك بأمان: ' + (e?.message || 'خطأ في التخزين'); updateStatus(m); speak(m); }
+    const m = 'أشياؤك المحفوظة: ' + items.map(i => i.name).join('، ') + '.';
+    updateStatus(m);
+    await speakWait(m + ' هل تريد حذف شيء منها؟ انتظر نغمتين من الميكروفون ثم قل نعم أو لا.');
+    wantDelete = isYes(await listenOnce(6000));
+  } catch (e) { speak('تعذر عرض أشيائك الآن.'); }
   finally { isProcessing = false; isListening = false; }
-  if (deleteTarget) await deletePersonalFlow(deleteTarget);
+  if (wantDelete) await deletePersonalFlow('');
 }
 async function deletePersonalFlow(nameRaw) {
   if (isProcessing) { updateStatus('انتظر انتهاء الطلب الحالي.'); return; }
@@ -2581,32 +2569,23 @@ async function deletePersonalFlow(nameRaw) {
     if (!items.length) { const m = 'لا توجد أشياء محفوظة لحذفها.'; updateStatus(m); speak(m); return; }
     let target = String(nameRaw || '').trim();
     if (!target) {
-      await speakWait('قل اسم الشيء الذي تريد حذفه أو رقم ترتيبه في قائمة أشيائك. سأذكر اسمه وأطلب تأكيدك قبل الحذف.');
+      await speakWait('أشياؤك المحفوظة: ' + items.map(i => i.name).join('، ') + '. انتظر نغمتين من الميكروفون، ثم انطق اسم الشيء الذي تريد حذفه.');
       target = (await listenOnce()).trim();
-      if (!target) { await speakWait('لم أسمع اسماً. لم يُحذف شيء.'); return; }
+      if (!target) { await speakWait('لم أسمع اسماً. أعد المحاولة من زر أشيائي.'); return; }
     }
     const n = normalizeArabicCommand(target);
-    const ordinal = n.match(/^(?:(?:الشيء|شيء|العنصر|عنصر)\s*)?(?:رقم\s*)?(\d+)$/);
-    let victim = null, victimOrdinal = null;
-    if (ordinal) {
-      victimOrdinal = Number(ordinal[1]);
-      if (!Number.isSafeInteger(victimOrdinal) || victimOrdinal < 1 || victimOrdinal > items.length) { await speakWait('لا يوجد عنصر بهذا الرقم في قائمتك الحالية. لديك ' + items.length + ' شيئاً. لم يُحذف شيء.'); return; }
-      victim = items[victimOrdinal - 1];
-    } else {
-      const exact = items.filter(it => normalizeArabicCommand(it.name) === n);
-      const matches = exact.length ? exact : items.filter(it => { const m = normalizeArabicCommand(it.name); return m.length >= 2 && n.length >= 2 && (m.includes(n) || n.includes(m)); });
-      if (!matches.length) { await speakWait('لم أجد شيئاً باسم ' + target + '. لم يُحذف شيء.'); return; }
-      if (matches.length > 1) { await speakWait('وجدت أكثر من شيء يطابق ' + target + ': ' + matches.slice(0, 5).map(i => i.name).join('، ') + '. لم أحذف شيئاً. قل الاسم كاملاً أو استخدم رقم العنصر بعد استعراض القائمة.'); return; }
-      victim = matches[0];
-    }
-    await speakWait((victimOrdinal ? 'العنصر رقم ' + victimOrdinal + ' واسمه ' : 'وجدت ') + victim.name + '. هل تؤكد حذف هذا الشيء من أشيائك؟ انتظر نغمتين ثم قل نعم للحذف أو لا للإلغاء.');
+    const exact = items.filter(it => normalizeArabicCommand(it.name) === n);
+    const partial = exact.length ? exact : items.filter(it => { const m = normalizeArabicCommand(it.name); return m.length >= 2 && n.length >= 2 && (m.includes(n) || n.includes(m)); });
+    if (!partial.length) { await speakWait('لم أجد شيئاً باسم ' + target + '.'); return; }
+    if (partial.length > 1) { await speakWait('وجدت أكثر من شيء بهذا الاسم: ' + partial.map(i => i.name).join('، ') + '. أعد المحاولة وانطق الاسم كاملاً.'); return; }
+    const victim = partial[0];
+    await speakWait('هل تريد حذف ' + victim.name + '؟ انتظر نغمتين من الميكروفون ثم قل نعم للحذف أو لا للإلغاء.');
     if (!isYes(await listenOnce())) { await speakWait('تم الإلغاء. لم يُحذف شيء.'); return; }
-    const nextItems = items.filter(it => it.id !== victim.id);
-    if (nextItems.length === items.length) { await speakWait('لم أتمكن من تحديد العنصر المحفوظ بمعرّفه. لم يُحذف شيء.'); return; }
-    const ok = await savePersonalItems(nextItems);
-    const m = ok ? ('تم حذف ' + victim.name + ' نهائياً من قائمة أشيائك على هذا الهاتف.') : ('تعذر حفظ عملية الحذف. لم أعتمد التغيير، وما زال العنصر محفوظاً.');
+    const idx = items.indexOf(victim); if (idx >= 0) items.splice(idx, 1);
+    const ok = await idbSet('items', items);
+    const m = ok ? ('تم حذف ' + victim.name + '.') : ('حُذف ' + victim.name + ' مؤقتاً فقط، وقد يعود عند إعادة فتح التطبيق.');
     updateStatus(m); await speakWait(m);
-  } catch (e) { const m = 'حدث خطأ أثناء الحذف، ولم أستطع تأكيد نجاح العملية.'; updateStatus(m); speak(m); }
+  } catch (e) { speak('حدث خطأ أثناء الحذف.'); }
   finally { isProcessing = false; isListening = false; }
 }
 
@@ -2633,7 +2612,7 @@ async function findPersonalLive(item, generalPool) {
     playSpatialBeep(sideFromPosition(best.pos), false); vibrate([50, 50, 50]);
     m = 'أظن أن ' + item.name + ' ' + best.pos + '.' + (MED_RE.test(item.name) ? ' هذا تخمين بصري؛ تأكد من الاسم المكتوب قبل الاستعمال.' : (isGeneral && item.kind === 'hazard' ? ' تأكد بعصاك.' : ''));
   } else m = 'لم أرَ ' + item.name + ' أمامي الآن. حرّك الهاتف ببطء يميناً ويساراً وأعد البحث.';
-  updateStatus(best ? ('(معايرة) ' + best.score.toFixed(2) + ' — ' + m) : m); lastDescription = m; speak(m);
+  updateStatus(DEV_MODE && best ? ('(معايرة) ' + best.score.toFixed(2) + ' — ' + m) : m); lastDescription = m; speak(m);
 }
 
 // «هل هذا X؟» — يُرجع false إذا لم يكن X من أشيائه المحفوظة ليُعامل السؤال كسؤال عادي.
@@ -2653,7 +2632,7 @@ async function verifyPersonal(targetRaw) {
       if (!(await ensurePersonalModel())) { speak('تعذر تجهيز النموذج.'); return; }
       const vv = await embedFrame();
       const d = personalMatch ? decidePersonal(vv, items) : decideGeneral(vv, generalClasses);
-      updateStatus('(معايرة) ' + (personalMatch ? 'خاص: ' : 'عام: ') + d.r.slice(0, 2).map(x => x.name + ' ' + x.score.toFixed(2)).join(' | '));
+      updateDebug('(معايرة) ' + (personalMatch ? 'خاص: ' : 'عام: ') + d.r.slice(0, 2).map(x => x.name + ' ' + x.score.toFixed(2)).join(' | '));
       let m;
       if (d.kind === 'match' && d.name === match.name) m = 'نعم، أظنه ' + match.name + '.' + (MED_RE.test(match.name) ? ' هذا تخمين بصري؛ تأكد من الاسم المكتوب قبل الاستعمال.' : (generalMatch && generalMatch.kind === 'hazard' ? ' تأكد بعصاك.' : ''));
       else if (d.kind === 'ambiguous' && (d.a === match.name || d.b === match.name)) m = 'قد يكون ' + match.name + ' لكنني لست متأكداً. قرّبه وأعد السؤال.';
