@@ -1468,46 +1468,164 @@ async function initLocalObjectEngine() {
 function getRelativePositionArabic(bbox, vw) { if (!bbox || !vw) return 'في الوسط'; const r = (bbox[0] + bbox[2] / 2) / vw; return r < 0.34 ? 'على اليسار' : (r > 0.66 ? 'على اليمين' : 'أمامك'); }
 function sideFromPosition(pos) { return pos === 'على اليسار' ? 'left' : (pos === 'على اليمين' ? 'right' : 'center'); }
 
+/* ===== محرك الطريق V2: تتبّع + تأكيد + زمن التصادم + كتم الأجسام البعيدة =====
+   كل الأرقام أدناه ابتدائية وتحتاج معايرة ميدانية (ثابتة في ROAD ليسهل ضبطها). لا يُعدّ هذا ضماناً للسلامة.
+   - لا تنبيه من إطار واحد (إلا ثقة عالية وقريب): يلزم رصد في إطارين لنفس الجسم.
+   - زمن التصادم TTC مأخوذ من نمو حجم الإطار عبر الزمن فقط، فلا يتأثر بافتراض زاوية الرؤية ولا بطول الصنف.
+   - لا يفرّق بين جسم يتحرك نحوك وبين اقترابك أنت منه؛ لذلك الصياغة «يقترب» وليست «تقترب منك». */
+const ROAD = Object.freeze({
+  TICK_MS: 700, EXPIRE_MS: 2500, MIN_IOU: 0.18, HIST_MS: 3000,
+  CONFIRM_HITS: 2, IMMEDIATE_SCORE: 0.75, MIN_SCORE: 0.56,
+  TTC_URGENT_S: 4.0, TTC_MIN_SPAN_MS: 1000, TTC_MIN_SAMPLES: 3, TTC_MIN_GROWTH: 1.12, MIN_SIZE_FRAC: 0.04,
+  PATH_L: 0.25, PATH_R: 0.75, PATH_OVERLAP: 0.4,
+  WARN_M: 5.0, SIDE_WARN_M: 2.5, VERY_CLOSE_M: 1.2,
+  REPEAT_URGENT_MS: 2500, REANNOUNCE_MS: 2500, DEDUPE_MS: 6000, MIN_GAP_MS: 900
+});
+const ROAD_MOVABLE = new Set(['person', 'car', 'bus', 'truck', 'motorcycle', 'bicycle', 'dog', 'cat']);
+let roadGen = 0, roadTracks = [], roadNextId = 1, roadRecent = new Map(), roadLastSpokenT = 0;
+function roadReset() { roadTracks = []; roadRecent = new Map(); roadLastSpokenT = 0; }
+function bboxIou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]), x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const iw = Math.max(0, x2 - x1), ih = Math.max(0, y2 - y1), inter = iw * ih, uni = a[2] * a[3] + b[2] * b[3] - inter;
+  return uni > 0 ? inter / uni : 0;
+}
+const trackSize = b => Math.sqrt(Math.max(1, b[2] * b[3]));
+// تطابق الإطارين: IoU، أو احتواء شبه كامل لإطار داخل الآخر (جسم يقترب بسرعة فيكبر إطاره أضعافاً بين إطارين متتاليين) بشرط تقارب المراكز.
+function boxMatchScore(a, b) {
+  const iou = bboxIou(a, b); if (iou >= ROAD.MIN_IOU) return iou;
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]), x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1), small = Math.min(a[2] * a[3], b[2] * b[3]), big = Math.max(a[2] * a[3], b[2] * b[3]);
+  if (small <= 0 || inter / small < 0.8 || big / small > 16) return 0;
+  const dx = (a[0] + a[2] / 2) - (b[0] + b[2] / 2), dy = (a[1] + a[3] / 2) - (b[1] + b[3] / 2), bw = Math.max(a[2], b[2]), bh = Math.max(a[3], b[3]);
+  return (Math.abs(dx) <= 0.25 * bw && Math.abs(dy) <= 0.25 * bh) ? 0.2 : 0;
+}
+function medianOf(a) { const s = a.slice().sort((x, y) => x - y), n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2])) : null; }
+function distBand(m) { return m <= 1.0 ? 0 : (m <= 2 ? 1 : (m <= 3.5 ? 2 : (m <= 6 ? 3 : 4))); }
+
+function roadUpdate(preds, t, vw, vh) {
+  for (const tr of roadTracks) tr.matched = false;
+  const cands = [];
+  for (const p of preds) {
+    if (!LOCAL_OBJECT_MAP[p.class] || !p.bbox) continue;
+    roadTracks.forEach((tr, i) => { if (tr.cls === p.class) { const v = boxMatchScore(tr.bbox, p.bbox); if (v > 0) cands.push({ i, p, v }); } });
+  }
+  cands.sort((a, b) => b.v - a.v);
+  const usedP = new Set();
+  for (const c of cands) {
+    const tr = roadTracks[c.i]; if (tr.matched || usedP.has(c.p)) continue;
+    tr.matched = true; usedP.add(c.p);
+    tr.bbox = c.p.bbox; tr.score = c.p.score || 0; tr.lastT = t; tr.hits++;
+    const d = estimateObjectDistance({ class: tr.cls, bbox: tr.bbox }, vw, vh);
+    tr.hist.push({ t, size: trackSize(tr.bbox), d: d ? d.meters : null });
+    while (tr.hist.length && t - tr.hist[0].t > ROAD.HIST_MS) tr.hist.shift();
+  }
+  for (const p of preds) {
+    if (!LOCAL_OBJECT_MAP[p.class] || !p.bbox || usedP.has(p)) continue;
+    const d = estimateObjectDistance(p, vw, vh);
+    roadTracks.push({ id: roadNextId++, cls: p.class, bbox: p.bbox, score: p.score || 0, firstT: t, lastT: t, hits: 1, matched: true, hist: [{ t, size: trackSize(p.bbox), d: d ? d.meters : null }], ann: null });
+  }
+  roadTracks = roadTracks.filter(tr => t - tr.lastT <= ROAD.EXPIRE_MS);
+  return roadTracks;
+}
+// زمن التصادم بالثواني من انحدار (1/الحجم) مع الزمن، أو null إن لم تتوفر عينات كافية أو لم يكن هناك اقتراب حقيقي.
+function roadTtc(tr, vh) {
+  const h = tr.hist; if (h.length < ROAD.TTC_MIN_SAMPLES) return null;
+  if (h[h.length - 1].t - h[0].t < ROAD.TTC_MIN_SPAN_MS) return null;
+  if (h[h.length - 1].size < ROAD.MIN_SIZE_FRAC * vh) return null;
+  const n = h.length, t0 = h[0].t; let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const s of h) { const x = (s.t - t0) / 1000, y = 1 / s.size; sx += x; sy += y; sxx += x * x; sxy += x * y; }
+  const den = n * sxx - sx * sx; if (Math.abs(den) < 1e-9) return null;
+  const b = (n * sxy - sx * sy) / den, a = (sy - b * sx) / n;
+  if (!(b < 0)) return null;
+  const xNow = (h[n - 1].t - t0) / 1000, yNow = a + b * xNow, yFirst = a;
+  if (!(yNow > 0) || yFirst / yNow < ROAD.TTC_MIN_GROWTH) return null;
+  return yNow / -b;
+}
+function roadClassify(tr, vw, vh) {
+  const meta = LOCAL_OBJECT_MAP[tr.cls], b = tr.bbox, cx = (b[0] + b[2] / 2) / vw;
+  const pos = cx < 0.34 ? 'على اليسار' : (cx > 0.66 ? 'على اليمين' : 'أمامك');
+  const ov = Math.max(0, Math.min(b[0] + b[2], ROAD.PATH_R * vw) - Math.max(b[0], ROAD.PATH_L * vw));
+  const inPath = ov >= ROAD.PATH_OVERLAP * b[2];
+  const ds = tr.hist.slice(-3).map(s => s.d).filter(x => x != null), d = ds.length ? medianOf(ds) : null;
+  const ttc = ROAD_MOVABLE.has(tr.cls) || meta.priority >= 2 ? roadTtc(tr, vh) : null;
+  const confirmed = tr.hits >= ROAD.CONFIRM_HITS || (tr.score >= ROAD.IMMEDIATE_SCORE && d != null && d <= 3);
+  let level = 0;
+  if (confirmed) {
+    const pr = meta.priority;
+    if (inPath && pr >= 2 && ttc != null && ttc <= ROAD.TTC_URGENT_S) level = 3; // بلا سقف مسافة: TTC لا يعتمد على المسافة المقدّرة
+    else if (inPath && pr >= 2 && d != null && d <= ROAD.VERY_CLOSE_M) level = 3;
+    else if (inPath && pr >= 2 && d != null && d <= ROAD.WARN_M) level = 2;
+    else if (!inPath && pr >= 3 && d != null && d <= ROAD.SIDE_WARN_M) level = 2;
+    else if (inPath && pr === 1 && d != null && d <= 2) level = 2;
+  }
+  return { meta, pos, inPath, d, ttc, level, band: d == null ? 4 : distBand(d) };
+}
+// يقرّر هل نتكلم الآن وبماذا. يرجع {level,msg,side,track} أو null. speakingNow: الجهاز يتكلم حالياً (نقاطع للمستوى 3 فقط).
+function roadDecide(t, vw, vh, speakingNow) {
+  let best = null;
+  for (const tr of roadTracks) {
+    const c = roadClassify(tr, vw, vh); tr.last = c;
+    if (!c.level) continue;
+    const score = c.level * 100 - (c.d == null ? 50 : Math.min(50, c.d * 4));
+    if (!best || score > best.score) best = { tr, c, score };
+  }
+  if (!best) return null;
+  const { tr, c } = best, a = tr.ann, key = tr.cls + '|' + c.pos, rec = roadRecent.get(key);
+  let speak_ = false;
+  if (c.level === 3) speak_ = !a || a.level < 3 || (t - a.t) >= ROAD.REPEAT_URGENT_MS;
+  else if (!speakingNow) {
+    if (!a || a.level < 2) speak_ = true;
+    else if (c.band < a.band && (t - a.t) >= ROAD.REANNOUNCE_MS) speak_ = true;
+    if (speak_ && rec && (t - rec.t) < ROAD.DEDUPE_MS && c.band >= rec.band) speak_ = false;
+    if (speak_ && (t - roadLastSpokenT) < ROAD.MIN_GAP_MS) speak_ = false;
+  }
+  if (!speak_) return null;
+  tr.ann = { level: c.level, band: c.band, t }; roadRecent.set(key, { t, band: c.band }); roadLastSpokenT = t;
+  const dist = c.d != null ? estimateObjectDistance({ class: tr.cls, bbox: tr.bbox }, vw, vh) : null;
+  const dtxt = dist ? (' — ' + dist.text) : '';
+  const msg = c.level === 3
+    ? ((c.ttc != null && c.ttc <= ROAD.TTC_URGENT_S ? ('انتبه! ' + c.meta.ar + ' ' + c.pos + ' يقترب بسرعة') : ('انتبه! ' + c.meta.ar + ' ' + c.pos + ' قريب جداً')) + dtxt + '!')
+    : (c.meta.ar + ' ' + c.pos + dtxt + '.');
+  return { level: c.level, msg, side: sideFromPosition(c.pos), track: tr };
+}
+
 function startLiveMonitoring() {
   if (liveMonitorTimer) return;
   if (localScanEnabled) initLocalObjectEngine();
-  liveMonitorTimer = setInterval(async () => {
-    if (isProcessing || isListening || isScanningFrame) return;
-    if (!videoElement || videoElement.paused || videoElement.ended || videoElement.videoWidth === 0) return;
-    const q = probeFrameQuality();
-    await evaluateContinuousAutoTorch(q);
-    if (!navModeEnabled || !localScanEnabled || assistantSpeaking || !objectModel || lifeMode === 'grooming' || lifeMode === 'clothes') return;
-    if (lifeMode === 'walk' && phonePitchBeta !== null && (Date.now() - lastTiltWarnTime) > 14000) {
-      if (phonePitchBeta > 112) { lastTiltWarnTime = Date.now(); speak('الكاميرا متجهة للأعلى؛ أمِل الهاتف للأمام قليلاً ليرى الطريق.', false); return; }
-      if (phonePitchBeta < 18)  { lastTiltWarnTime = Date.now(); speak('الكاميرا تنظر لأسفل جداً؛ ارفعها قليلاً.', false); return; }
-    }
-    isScanningFrame = true;
+  roadReset(); const gen = ++roadGen;
+  let lastQualityT = 0;
+  const tick = async () => {
+    if (!liveMonitorTimer || gen !== roadGen) return;
     try {
-      const preds = await objectModel.detect(videoElement, 5, 0.56);
-      const objects = (preds || []).filter(p => LOCAL_OBJECT_MAP[p.class])
-        .sort((a, b) => ((LOCAL_OBJECT_MAP[b.class].priority || 1) - (LOCAL_OBJECT_MAP[a.class].priority || 1)) || ((b.score || 0) - (a.score || 0)));
-      const top = objects[0];
-      if (!top) { prevCenterThreat = null; return; }
-      const meta = LOCAL_OBJECT_MAP[top.class], pos = getRelativePositionArabic(top.bbox, videoElement.videoWidth);
-      const dist = estimateObjectDistance(top, videoElement.videoWidth, videoElement.videoHeight), area = top.bbox[2] * top.bbox[3], now = Date.now();
-      let loomingUrgent = false;
-      if (meta.priority >= 3 && pos === 'أمامك') {
-        if (prevCenterThreat && prevCenterThreat.cls === top.class && (now - prevCenterThreat.t) < 2000 && prevCenterThreat.area > 0 && ((area - prevCenterThreat.area) / prevCenterThreat.area) >= 0.34) loomingUrgent = true;
-        prevCenterThreat = { cls: top.class, area, t: now };
-      } else prevCenterThreat = null;
-      const key = (loomingUrgent ? 'LOOM_' : 'obj_') + top.class + '_' + pos;
-      if (loomingUrgent || key !== lastHazardAlertKey || (now - lastHazardAlertTime) > 6500) {
-        lastHazardAlertKey = key; lastHazardAlertTime = now;
-        const urgent = loomingUrgent || meta.priority >= 3 || (dist && dist.steps <= 2);
-        playSpatialBeep(sideFromPosition(pos), urgent);
-        vibrate(loomingUrgent ? [120, 45, 120, 45, 120] : (urgent ? [85, 55, 85] : [35]));
-        const msg = loomingUrgent ? ('انتبه! ' + meta.ar + ' تقترب منك بسرعة ' + (dist ? ('— ' + dist.text) : '') + '!') : (meta.ar + ' ' + pos + (dist ? (' — ' + dist.text) : '') + '.');
-        updateStatus(msg); updateRiskIndicator(urgent ? 'يستلزم الحذر' : 'لم يظهر خطر واضح في الصورة'); speak(msg, true);
+      if ((isProcessing && !cloudInFlight) || isListening || isScanningFrame) return;
+      if (!videoElement || videoElement.paused || videoElement.ended || videoElement.videoWidth === 0) return;
+      const nowMs = Date.now();
+      if (nowMs - lastQualityT >= 1200) { lastQualityT = nowMs; await evaluateContinuousAutoTorch(probeFrameQuality()); }
+      if (!navModeEnabled || !localScanEnabled || !objectModel || lifeMode === 'grooming' || lifeMode === 'clothes') return;
+      if (lifeMode === 'walk' && phonePitchBeta !== null && (Date.now() - lastTiltWarnTime) > 14000 && !assistantSpeaking) {
+        if (phonePitchBeta > 112) { lastTiltWarnTime = Date.now(); speak('الكاميرا متجهة للأعلى؛ أمِل الهاتف للأمام قليلاً ليرى الطريق.', false); return; }
+        if (phonePitchBeta < 18)  { lastTiltWarnTime = Date.now(); speak('الكاميرا تنظر لأسفل جداً؛ ارفعها قليلاً.', false); return; }
       }
-    } catch (e) {} finally { isScanningFrame = false; }
-  }, 1200);
+      isScanningFrame = true;
+      try {
+        const preds = await objectModel.detect(videoElement, 8, ROAD.MIN_SCORE);
+        const t = performance.now(), vw = videoElement.videoWidth, vh = videoElement.videoHeight;
+        roadUpdate(preds || [], t, vw, vh);
+        const al = roadDecide(t, vw, vh, assistantSpeaking);
+        if (DEV_MODE) updateDebug('(معايرة) مسارات: ' + roadTracks.map(x => x.cls + '#' + x.id + (x.last ? (' d=' + (x.last.d != null ? x.last.d.toFixed(1) : '-') + (x.last.ttc != null ? ' ttc=' + x.last.ttc.toFixed(1) : '') + ' L' + x.last.level) : '')).join(' | '));
+        if (al) {
+          const urgent = al.level === 3;
+          playSpatialBeep(al.side, urgent);
+          vibrate(urgent ? [120, 45, 120, 45, 120] : [60, 40, 60]);
+          if (!DEV_MODE) updateStatus(al.msg);
+          updateRiskIndicator(urgent ? 'خطر ظاهر' : 'يستلزم الحذر'); speak(al.msg, true);
+        }
+      } catch (e) {} finally { isScanningFrame = false; }
+    } finally { if (liveMonitorTimer && gen === roadGen) liveMonitorTimer = setTimeout(tick, ROAD.TICK_MS); }
+  };
+  liveMonitorTimer = setTimeout(tick, ROAD.TICK_MS);
 }
-function stopLiveMonitoring() { if (liveMonitorTimer) { clearInterval(liveMonitorTimer); liveMonitorTimer = null; } }
+function stopLiveMonitoring() { if (liveMonitorTimer) { clearTimeout(liveMonitorTimer); liveMonitorTimer = null; } roadReset(); }
 function setNavMode(on, announce) {
   navModeEnabled = !!on; writeLS(LS_NAV_MODE, navModeEnabled);
   if (navModeCheckbox) navModeCheckbox.checked = navModeEnabled;
